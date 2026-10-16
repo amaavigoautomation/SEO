@@ -1,0 +1,1022 @@
+From f987512351747ae354bc301fecb7aecc973ecca2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 12:12:47 +0000
+Subject: [PATCH] Add fixed content workflows, approval status flow with audit
+ history, and dashboard filters
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RWJ6gP3xXYYcCnh6uwHZd3
+---
+ .env.example                         |  21 ++++
+ README.md                            |  17 +++
+ app/api/chats/[id]/messages/route.ts |  31 +++++-
+ app/api/chats/[id]/status/route.ts   |  46 +++++++++
+ app/api/chats/route.ts               |  27 ++++-
+ app/chat/[id]/page.tsx               |  13 ++-
+ app/globals.css                      |   6 +-
+ app/page.tsx                         |  64 +++++++++---
+ components/ChatView.tsx              |  50 ++++++---
+ components/NewChatForm.tsx           |  65 +++++++++++-
+ components/StatusPanel.tsx           | 110 ++++++++++++++++++++
+ lib/prompt.ts                        |   8 +-
+ lib/status.ts                        |  42 ++++++++
+ lib/workflows.ts                     | 149 +++++++++++++++++++++++++++
+ prisma/schema.prisma                 |  29 +++++-
+ 15 files changed, 631 insertions(+), 47 deletions(-)
+ create mode 100644 .env.example
+ create mode 100644 app/api/chats/[id]/status/route.ts
+ create mode 100644 components/StatusPanel.tsx
+ create mode 100644 lib/status.ts
+ create mode 100644 lib/workflows.ts
+
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..393d109
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,21 @@
++# Postgres (Neon / Vercel Postgres / local). Same value on Vercel.
++GROWTH_OS_DATABASE_URL="postgresql://user:pass@host/db?sslmode=require"
++
++# OpenAI text
++OPENAI_API_KEY="sk-..."
++OPENAI_MODEL="gpt-6-astra"
++OPENAI_FALLBACK_MODEL="gpt-6-luna"
++# (run `npm run check:models` to confirm your key can use these)
++
++# Images: openai | gemini
++IMAGE_PROVIDER="openai"
++OPENAI_IMAGE_MODEL="gpt-image-2.5-flare"
++OPENAI_IMAGE_SIZE="1536x1024"
++# Gemini image models need a paid/billing-enabled key
++GEMINI_API_KEY=""
++GEMINI_IMAGE_MODEL=""
++GEMINI_IMAGE_ASPECT="16:9"
++
++# Team login (shared password)
++APP_PASSWORD="change-me"
++AUTH_SECRET="long-random-string"
+diff --git a/README.md b/README.md
+index e139776..5ef3afd 100644
+--- a/README.md
++++ b/README.md
+@@ -29,3 +29,20 @@ Chat and image routes allow up to 300s (Vercel Hobby maximum).
+ ## Find which models work on your key
+ `npm run check:models` tests every chat model your key can use and prints your request/minute and token/minute limits.
+ The first line of its output lists the image models on your key; put one in OPENAI_IMAGE_MODEL.
++
++## Workflows and approval (added)
++
++**Content types** (pick on "New chat"): SEO blog, SEO brief, AEO FAQ, GEO content, Social posts, Free chat. Each has fixed input fields and fixed output rules on top of the brand context. Then keep chatting to request edits or new topics.
++
++**Status flow:** Draft → In review → Approved → Ready to publish. A reviewer can send In review → Changes requested (comment required). Approved chats are locked until reopened. Editing a chat in review sends it back to Draft. Every step is stored in the chat's History with who and when.
++
++**Dashboard:** the home page shows counts per status and filters by brand, status and content type.
++
++**Upgrade an existing database:** after pulling this branch run
++
++    npx prisma db push
++    npx prisma generate
++
++Existing chats become "Free chat" / "Draft". Then restart `npm run dev`.
++
++**Vercel:** set every variable from `.env.example` in Project → Settings → Environment Variables, use a hosted Postgres, deploy.
+diff --git a/app/api/chats/[id]/messages/route.ts b/app/api/chats/[id]/messages/route.ts
+index 5215630..a08318e 100644
+--- a/app/api/chats/[id]/messages/route.ts
++++ b/app/api/chats/[id]/messages/route.ts
+@@ -5,6 +5,8 @@ import { prisma } from "@/lib/prisma";
+ import { getSession } from "@/lib/session";
+ import { generate, type ChatMessage } from "@/lib/openai";
+ import { buildSystem } from "@/lib/prompt";
++import { getWorkflow } from "@/lib/workflows";
++import { LOCKED } from "@/lib/status";
+ 
+ const HISTORY_LIMIT = 20; // last N messages are sent along with the brand context
+ 
+@@ -20,6 +22,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
+ 
+   const chat = await prisma.conversation.findUnique({ where: { id }, include: { brand: true } });
+   if (!chat) return NextResponse.json({ error: "Chat not found" }, { status: 404 });
++  if (LOCKED.includes(chat.status)) {
++    return NextResponse.json({ error: "This chat is approved. Reopen it to make changes." }, { status: 409 });
++  }
+ 
+   const recent = await prisma.message.findMany({
+     where: { conversationId: id },
+@@ -32,7 +37,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
+ 
+   try {
+     const { text, model } = await generate([
+-      buildSystem(chat.brand.name, chat.brand.context),
++      buildSystem(chat.brand.name, chat.brand.context, getWorkflow(chat.workflow)),
+       ...history,
+       { role: "user", content: message },
+     ]);
+@@ -43,7 +48,29 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
+     const assistant = await prisma.message.create({
+       data: { conversationId: id, role: "assistant", content: text, model, createdAt: new Date(now + 1) },
+     });
+-    await prisma.conversation.update({ where: { id }, data: { updatedAt: new Date() } });
++
++    // Editing a chat that was in review or had changes requested sends it back to draft.
++    const backToDraft = chat.status === "in_review" || chat.status === "changes_requested";
++    await prisma.conversation.update({
++      where: { id },
++      data: {
++        updatedAt: new Date(),
++        ...(backToDraft
++          ? {
++              status: "draft",
++              events: {
++                create: {
++                  action: "back_to_draft",
++                  actor: session.name,
++                  fromStatus: chat.status,
++                  toStatus: "draft",
++                  comment: "New edit requested in chat",
++                },
++              },
++            }
++          : {}),
++      },
++    });
+     return NextResponse.json({
+       user: { id: user.id, role: "user", content: user.content, createdBy: user.createdBy, model: null, images: [] },
+       assistant: { id: assistant.id, role: "assistant", content: assistant.content, createdBy: null, model, images: [] },
+diff --git a/app/api/chats/[id]/status/route.ts b/app/api/chats/[id]/status/route.ts
+new file mode 100644
+index 0000000..0763ea3
+--- /dev/null
++++ b/app/api/chats/[id]/status/route.ts
+@@ -0,0 +1,46 @@
++export const dynamic = "force-dynamic";
++import { NextRequest, NextResponse } from "next/server";
++import { prisma } from "@/lib/prisma";
++import { getSession } from "@/lib/session";
++import { applyAction } from "@/lib/status";
++
++// POST /api/chats/:id/status { action, comment? }
++// actions: send_for_review | approve | request_changes | ready_to_publish | reopen
++export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
++  const session = await getSession();
++  if (!session) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
++
++  const { id } = await params;
++  const body = await req.json().catch(() => ({}));
++  const action = String(body.action ?? "");
++  const comment = String(body.comment ?? "").trim().slice(0, 2000);
++
++  const chat = await prisma.conversation.findUnique({ where: { id } });
++  if (!chat) return NextResponse.json({ error: "Chat not found" }, { status: 404 });
++
++  const result = applyAction(chat.status, action, comment);
++  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 409 });
++
++  if (action === "send_for_review") {
++    const replies = await prisma.message.count({ where: { conversationId: id, role: "assistant" } });
++    if (replies === 0) return NextResponse.json({ error: "There is no draft to review yet" }, { status: 409 });
++  }
++
++  await prisma.conversation.update({
++    where: { id },
++    data: {
++      status: result.to,
++      updatedAt: new Date(),
++      events: {
++        create: {
++          action,
++          actor: session.name,
++          fromStatus: chat.status,
++          toStatus: result.to,
++          comment: comment || null,
++        },
++      },
++    },
++  });
++  return NextResponse.json({ ok: true, status: result.to });
++}
+diff --git a/app/api/chats/route.ts b/app/api/chats/route.ts
+index de78bf1..b5eae5b 100644
+--- a/app/api/chats/route.ts
++++ b/app/api/chats/route.ts
+@@ -5,27 +5,43 @@ import { prisma } from "@/lib/prisma";
+ import { getSession } from "@/lib/session";
+ import { generate } from "@/lib/openai";
+ import { buildSystem } from "@/lib/prompt";
++import { getWorkflow } from "@/lib/workflows";
+ 
+-// POST /api/chats { brandId, message } -> starts a chat and returns the first reply
++// POST /api/chats { brandId, workflow, values } -> starts a chat from a workflow and returns the first reply
+ export async function POST(req: NextRequest) {
+   const session = await getSession();
+   if (!session) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+ 
+   const body = await req.json().catch(() => ({}));
+   const brandId = String(body.brandId ?? "");
+-  const message = String(body.message ?? "").trim();
+-  if (!brandId || !message) return NextResponse.json({ error: "brandId and message are required" }, { status: 400 });
++  const workflow = getWorkflow(String(body.workflow ?? "free"));
++  if (!brandId || !workflow) return NextResponse.json({ error: "brandId and a valid workflow are required" }, { status: 400 });
++
++  // keep only known string fields, trimmed and length-limited
++  const raw = (body.values ?? {}) as Record<string, unknown>;
++  const values: Record<string, string> = {};
++  for (const f of workflow.fields) {
++    values[f.name] = typeof raw[f.name] === "string" ? (raw[f.name] as string).trim().slice(0, 5000) : "";
++  }
++  const missing = workflow.fields.find((f) => f.required && !values[f.name]);
++  if (missing) return NextResponse.json({ error: `${missing.label} is required` }, { status: 400 });
+ 
+   const brand = await prisma.brand.findUnique({ where: { id: brandId } });
+   if (!brand) return NextResponse.json({ error: "Unknown brand" }, { status: 404 });
+ 
++  const message = workflow.buildMessage(values);
+   try {
+-    const { text, model } = await generate([buildSystem(brand.name, brand.context), { role: "user", content: message }]);
++    const { text, model } = await generate([
++      buildSystem(brand.name, brand.context, workflow),
++      { role: "user", content: message },
++    ]);
+     const now = Date.now();
+     const chat = await prisma.conversation.create({
+       data: {
+         brandId,
+-        title: message.replace(/\s+/g, " ").slice(0, 80),
++        workflow: workflow.key,
++        status: "draft",
++        title: workflow.title(values).replace(/\s+/g, " ").slice(0, 80),
+         createdBy: session.name,
+         messages: {
+           create: [
+@@ -33,6 +49,7 @@ export async function POST(req: NextRequest) {
+             { role: "assistant", content: text, model, createdAt: new Date(now + 1) },
+           ],
+         },
++        events: { create: { action: "created", actor: session.name, toStatus: "draft", comment: workflow.label } },
+       },
+     });
+     return NextResponse.json({ chatId: chat.id }, { status: 201 });
+diff --git a/app/chat/[id]/page.tsx b/app/chat/[id]/page.tsx
+index d3d7314..e46bf04 100644
+--- a/app/chat/[id]/page.tsx
++++ b/app/chat/[id]/page.tsx
+@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
+ import Link from "next/link";
+ import { notFound } from "next/navigation";
+ import { prisma } from "@/lib/prisma";
++import { getWorkflow } from "@/lib/workflows";
+ import ChatView, { type Msg } from "@/components/ChatView";
+ 
+ export default async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
+@@ -10,6 +11,7 @@ export default async function ChatPage({ params }: { params: Promise<{ id: strin
+     where: { id },
+     include: {
+       brand: true,
++      events: { orderBy: { createdAt: "desc" } },
+       messages: { orderBy: { createdAt: "asc" }, include: { images: { select: { id: true, slot: true } } } },
+     },
+   });
+@@ -26,11 +28,18 @@ export default async function ChatPage({ params }: { params: Promise<{ id: strin
+     }),
+   );
+ 
++  const events = chat.events.map(
++    (e: { id: string; action: string; actor: string; fromStatus: string | null; toStatus: string | null; comment: string | null; createdAt: Date }) => ({
++      ...e,
++      createdAt: e.createdAt.toISOString(),
++    }),
++  );
++
+   return (
+     <>
+-      <p className="muted" style={{ marginTop: 0 }}><Link href="/">Chats</Link> / {chat.brand.name}</p>
++      <p className="muted" style={{ marginTop: 0 }}><Link href="/">Chats</Link> / {chat.brand.name} / {getWorkflow(chat.workflow)?.label ?? "Free chat"}</p>
+       <h1>{chat.title}</h1>
+-      <ChatView chatId={chat.id} initial={initial} />
++      <ChatView chatId={chat.id} initial={initial} status={chat.status} events={events} />
+     </>
+   );
+ }
+diff --git a/app/globals.css b/app/globals.css
+index bc9d8fb..3ad313c 100644
+--- a/app/globals.css
++++ b/app/globals.css
+@@ -34,7 +34,11 @@ th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacin
+ th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+ td a { text-decoration: none; font-weight: 600; }
+ .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; }
+-.pill.pending_review { color: var(--warn); } .pill.approved { color: var(--ok); } .pill.failed { color: var(--bad); }
++.pill { color: var(--muted); }
++.pill.draft { color: var(--muted); } .pill.in_review { color: var(--warn); } .pill.changes_requested { color: var(--bad); }
++.pill.approved { color: var(--ok); } .pill.ready_to_publish { color: var(--accent); }
++button.pill.choice { background: transparent; cursor: pointer; padding: 5px 12px; font-size: 13px; color: var(--muted); }
++button.pill.choice.on { color: var(--accent-text); background: var(--accent); border-color: var(--accent); }
+ .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+ .output { white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
+ details { border-top: 1px solid var(--line); padding: 10px 0; }
+diff --git a/app/page.tsx b/app/page.tsx
+index 8490efe..2edcf81 100644
+--- a/app/page.tsx
++++ b/app/page.tsx
+@@ -2,17 +2,42 @@ export const dynamic = "force-dynamic";
+ import Link from "next/link";
+ import { prisma } from "@/lib/prisma";
+ import { fmt } from "@/lib/format";
++import { STATUSES, STATUS_LABEL } from "@/lib/status";
++import { WORKFLOWS, WORKFLOW_LABEL } from "@/lib/workflows";
+ 
+-export default async function Home({ searchParams }: { searchParams: Promise<{ brand?: string }> }) {
+-  const { brand: brandId } = await searchParams;
++type Row = {
++  id: string; title: string; createdBy: string; updatedAt: Date; status: string; workflow: string; brandId: string;
++  brand: { name: string }; _count: { messages: number };
++};
++
++export default async function Home({ searchParams }: { searchParams: Promise<{ brand?: string; status?: string; workflow?: string }> }) {
++  const { brand: brandId, status, workflow } = await searchParams;
+   const brands = await prisma.brand.findMany({ orderBy: { name: "asc" } });
+-  const chats = await prisma.conversation.findMany({
+-    where: brandId ? { brandId } : undefined,
++  const all: Row[] = await prisma.conversation.findMany({
+     orderBy: { updatedAt: "desc" },
+-    take: 100,
++    take: 500,
+     include: { brand: true, _count: { select: { messages: true } } },
+   });
+ 
++  // progress counts follow the brand filter only, so they stay clickable as status filters
++  const inBrand = brandId ? all.filter((c) => c.brandId === brandId) : all;
++  const counts: Record<string, number> = {};
++  for (const c of inBrand) counts[c.status] = (counts[c.status] ?? 0) + 1;
++  const chats = inBrand.filter((c) => (!status || c.status === status) && (!workflow || c.workflow === workflow)).slice(0, 100);
++
++  const href = (o: { brand?: string; status?: string; workflow?: string }) => {
++    const q = new URLSearchParams();
++    const b = "brand" in o ? o.brand : brandId;
++    const s = "status" in o ? o.status : status;
++    const w = "workflow" in o ? o.workflow : workflow;
++    if (b) q.set("brand", b);
++    if (s) q.set("status", s);
++    if (w) q.set("workflow", w);
++    const str = q.toString();
++    return str ? `/?${str}` : "/";
++  };
++  const bold = (on: boolean) => ({ fontWeight: on ? 700 : 400 });
++
+   return (
+     <>
+       <div className="row" style={{ justifyContent: "space-between", marginTop: 0 }}>
+@@ -21,31 +46,46 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ b
+       </div>
+ 
+       <div className="chips" style={{ marginTop: 16 }}>
+-        <Link className="pill" href="/" style={{ fontWeight: brandId ? 400 : 700 }}>All brands</Link>
++        <Link className="pill" href={href({ brand: undefined })} style={bold(!brandId)}>All brands</Link>
+         {brands.map((b: { id: string; name: string }) => (
+-          <Link key={b.id} className="pill" href={`/?brand=${b.id}`} style={{ fontWeight: brandId === b.id ? 700 : 400 }}>
+-            {b.name}
++          <Link key={b.id} className="pill" href={href({ brand: b.id })} style={bold(brandId === b.id)}>{b.name}</Link>
++        ))}
++      </div>
++
++      <div className="chips">
++        <Link className="pill" href={href({ status: undefined })} style={bold(!status)}>All ({inBrand.length})</Link>
++        {STATUSES.map((s) => (
++          <Link key={s} className={`pill ${s}`} href={href({ status: s })} style={bold(status === s)}>
++            {STATUS_LABEL[s]} ({counts[s] ?? 0})
+           </Link>
+         ))}
+       </div>
+ 
++      <div className="chips">
++        <Link className="pill" href={href({ workflow: undefined })} style={bold(!workflow)}>Any type</Link>
++        {WORKFLOWS.map((w) => (
++          <Link key={w.key} className="pill" href={href({ workflow: w.key })} style={bold(workflow === w.key)}>{w.label}</Link>
++        ))}
++      </div>
++
+       <div className="card" style={{ padding: 0, overflowX: "auto" }}>
+         <table>
+           <thead>
+-            <tr><th>Brand</th><th>Chat</th><th>Messages</th><th>Started by</th><th>Last active (IST)</th></tr>
++            <tr><th>Brand</th><th>Chat</th><th>Type</th><th>Status</th><th>Started by</th><th>Last active (IST)</th></tr>
+           </thead>
+           <tbody>
+-            {chats.map((c: { id: string; title: string; createdBy: string; updatedAt: Date; brand: { name: string }; _count: { messages: number } }) => (
++            {chats.map((c) => (
+               <tr key={c.id}>
+                 <td>{c.brand.name}</td>
+                 <td><Link href={`/chat/${c.id}`}>{c.title}</Link></td>
+-                <td>{c._count.messages}</td>
++                <td>{WORKFLOW_LABEL[c.workflow] ?? "Free chat"}</td>
++                <td><span className={`pill ${c.status}`}>{STATUS_LABEL[c.status] ?? c.status}</span></td>
+                 <td>{c.createdBy}</td>
+                 <td>{fmt(c.updatedAt)}</td>
+               </tr>
+             ))}
+             {chats.length === 0 && (
+-              <tr><td colSpan={5} className="muted" style={{ padding: 20 }}>No chats yet. Start with “New chat”.</td></tr>
++              <tr><td colSpan={6} className="muted" style={{ padding: 20 }}>No chats match. Start with “New chat”.</td></tr>
+             )}
+           </tbody>
+         </table>
+diff --git a/components/ChatView.tsx b/components/ChatView.tsx
+index 9cd5403..9805aee 100644
+--- a/components/ChatView.tsx
++++ b/components/ChatView.tsx
+@@ -1,7 +1,10 @@
+ "use client";
+ import { useEffect, useRef, useState } from "react";
++import { useRouter } from "next/navigation";
+ import MessageBody from "./MessageBody";
++import StatusPanel, { type EventRow } from "./StatusPanel";
+ import { toHtmlBody, toHtmlDocument, toMarkdown } from "@/lib/export";
++import { LOCKED } from "@/lib/status";
+ 
+ export type Msg = {
+   id: string;
+@@ -12,13 +15,17 @@ export type Msg = {
+   images: { slot: number; id: string }[];
+ };
+ 
+-export default function ChatView({ chatId, initial }: { chatId: string; initial: Msg[] }) {
++export default function ChatView({
++  chatId, initial, status, events,
++}: { chatId: string; initial: Msg[]; status: string; events: EventRow[] }) {
++  const router = useRouter();
+   const [msgs, setMsgs] = useState<Msg[]>(initial);
+   const [input, setInput] = useState("");
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState("");
+   const [note, setNote] = useState("");
+   const endRef = useRef<HTMLDivElement>(null);
++  const locked = LOCKED.includes(status);
+ 
+   useEffect(() => {
+     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+@@ -26,7 +33,7 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
+ 
+   async function send() {
+     const message = input.trim();
+-    if (!message || busy) return;
++    if (!message || busy || locked) return;
+     setBusy(true);
+     setError("");
+     try {
+@@ -39,6 +46,7 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
+       if (res.ok) {
+         setMsgs((m) => [...m, data.user, data.assistant]);
+         setInput("");
++        router.refresh(); // status may have gone back to draft
+       } else {
+         setError(data.error ?? `Request failed (${res.status})`);
+       }
+@@ -77,6 +85,14 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
+ 
+   return (
+     <>
++      <StatusPanel
++        chatId={chatId}
++        status={status}
++        events={events}
++        hasDraft={msgs.some((m) => m.role === "assistant")}
++        onApplyFeedback={(t) => setInput(t)}
++      />
++
+       <div className="chat">
+         {msgs.map((m) =>
+           m.role === "user" ? (
+@@ -109,18 +125,24 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
+       <div className="composer">
+         {note && <p className="muted" style={{ margin: "0 0 6px" }}>{note}</p>}
+         {error && <p className="error" style={{ margin: "0 0 6px" }}>{error}</p>}
+-        <textarea
+-          value={input}
+-          onChange={(e) => setInput(e.target.value)}
+-          onKeyDown={(e) => {
+-            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
+-          }}
+-          placeholder="Ask for changes, or a new topic. e.g. make the intro shorter / now write a blog on Umrah package management software"
+-        />
+-        <div className="row" style={{ marginTop: 8 }}>
+-          <button className="primary" onClick={send} disabled={busy || !input.trim()}>{busy ? "Writing..." : "Send"}</button>
+-          <span className="muted">Ctrl+Enter to send</span>
+-        </div>
++        {locked ? (
++          <p className="muted">This chat is locked because it is approved. Use “Reopen for editing” above to make changes.</p>
++        ) : (
++          <>
++            <textarea
++              value={input}
++              onChange={(e) => setInput(e.target.value)}
++              onKeyDown={(e) => {
++                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
++              }}
++              placeholder="Ask for changes, or a new topic. e.g. make the intro shorter / now write a blog on Umrah package management software"
++            />
++            <div className="row" style={{ marginTop: 8 }}>
++              <button className="primary" onClick={send} disabled={busy || !input.trim()}>{busy ? "Writing..." : "Send"}</button>
++              <span className="muted">Ctrl+Enter to send</span>
++            </div>
++          </>
++        )}
+       </div>
+     </>
+   );
+diff --git a/components/NewChatForm.tsx b/components/NewChatForm.tsx
+index 43201f3..a79bba3 100644
+--- a/components/NewChatForm.tsx
++++ b/components/NewChatForm.tsx
+@@ -1,13 +1,27 @@
+ "use client";
+ import { useState } from "react";
+ import { useRouter } from "next/navigation";
++import { WORKFLOWS, getWorkflow } from "@/lib/workflows";
++
++function defaults(key: string): Record<string, string> {
++  const wf = getWorkflow(key);
++  return Object.fromEntries((wf?.fields ?? []).map((f) => [f.name, f.defaultValue ?? ""]));
++}
+ 
+ export default function NewChatForm({ brands, initialBrandId }: { brands: { id: string; name: string }[]; initialBrandId: string }) {
+   const router = useRouter();
+   const [brandId, setBrandId] = useState(initialBrandId);
+-  const [message, setMessage] = useState("");
++  const [workflowKey, setWorkflowKey] = useState(WORKFLOWS[0].key);
++  const [values, setValues] = useState<Record<string, string>>(defaults(WORKFLOWS[0].key));
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState("");
++  const workflow = getWorkflow(workflowKey)!;
++
++  function pick(key: string) {
++    setWorkflowKey(key);
++    setValues(defaults(key));
++    setError("");
++  }
+ 
+   async function submit(e: React.FormEvent) {
+     e.preventDefault();
+@@ -17,7 +31,7 @@ export default function NewChatForm({ brands, initialBrandId }: { brands: { id:
+       const res = await fetch("/api/chats", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ brandId, message }),
++        body: JSON.stringify({ brandId, workflow: workflowKey, values }),
+       });
+       const data = await res.json().catch(() => ({}));
+       if (res.ok) {
+@@ -37,9 +51,50 @@ export default function NewChatForm({ brands, initialBrandId }: { brands: { id:
+       <select id="brand" value={brandId} onChange={(e) => setBrandId(e.target.value)} required>
+         {brands.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+       </select>
+-      <label htmlFor="msg">What do you want written?</label>
+-      <textarea id="msg" value={message} onChange={(e) => setMessage(e.target.value)} required
+-        placeholder="e.g. Write a blog on how Hajj agencies in India can manage pilgrim documents with software. Add images." />
++
++      <label>Content type</label>
++      <div className="chips" style={{ marginBottom: 4 }}>
++        {WORKFLOWS.map((w) => (
++          <button
++            type="button"
++            key={w.key}
++            className={`pill choice${w.key === workflowKey ? " on" : ""}`}
++            onClick={() => pick(w.key)}
++          >
++            {w.label}
++          </button>
++        ))}
++      </div>
++      <p className="muted" style={{ margin: "0 0 4px" }}>{workflow.description}</p>
++
++      {workflow.fields.map((f) => (
++        <div key={f.name}>
++          <label htmlFor={`f-${f.name}`}>{f.label}{f.required ? " *" : ""}</label>
++          {f.type === "textarea" ? (
++            <textarea
++              id={`f-${f.name}`}
++              value={values[f.name] ?? ""}
++              placeholder={f.placeholder}
++              required={f.required}
++              style={{ minHeight: workflow.key === "free" ? 140 : 80 }}
++              onChange={(e) => setValues({ ...values, [f.name]: e.target.value })}
++            />
++          ) : f.type === "select" ? (
++            <select id={`f-${f.name}`} value={values[f.name] ?? ""} onChange={(e) => setValues({ ...values, [f.name]: e.target.value })}>
++              {f.options?.map((o) => <option key={o} value={o}>{o}</option>)}
++            </select>
++          ) : (
++            <input
++              id={`f-${f.name}`}
++              value={values[f.name] ?? ""}
++              placeholder={f.placeholder}
++              required={f.required}
++              onChange={(e) => setValues({ ...values, [f.name]: e.target.value })}
++            />
++          )}
++        </div>
++      ))}
++
+       {error && <p className="error">{error}</p>}
+       <div className="row">
+         <button className="primary" disabled={busy || !brandId}>{busy ? "Writing..." : "Start chat"}</button>
+diff --git a/components/StatusPanel.tsx b/components/StatusPanel.tsx
+new file mode 100644
+index 0000000..1ee71e5
+--- /dev/null
++++ b/components/StatusPanel.tsx
+@@ -0,0 +1,110 @@
++"use client";
++import { useState } from "react";
++import { useRouter } from "next/navigation";
++import { ACTIONS, STATUS_LABEL, availableActions, type ActionKey } from "@/lib/status";
++import { fmt } from "@/lib/format";
++
++export type EventRow = {
++  id: string;
++  action: string;
++  actor: string;
++  fromStatus: string | null;
++  toStatus: string | null;
++  comment: string | null;
++  createdAt: string;
++};
++
++export default function StatusPanel({
++  chatId, status, events, hasDraft, onApplyFeedback,
++}: {
++  chatId: string; status: string; events: EventRow[]; hasDraft: boolean; onApplyFeedback: (text: string) => void;
++}) {
++  const router = useRouter();
++  const [busy, setBusy] = useState("");
++  const [error, setError] = useState("");
++  const [askingChanges, setAskingChanges] = useState(false);
++  const [comment, setComment] = useState("");
++
++  const actions = availableActions(status).filter((a) => a !== "send_for_review" || hasDraft);
++  const feedback = status === "changes_requested" ? events.find((e) => e.action === "request_changes") : undefined;
++
++  async function run(action: ActionKey, text = "") {
++    setBusy(action);
++    setError("");
++    try {
++      const res = await fetch(`/api/chats/${chatId}/status`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ action, comment: text }),
++      });
++      if (res.ok) {
++        setAskingChanges(false);
++        setComment("");
++        router.refresh();
++      } else {
++        setError((await res.json().catch(() => ({}))).error ?? `Failed (${res.status})`);
++      }
++    } catch {
++      setError("Network error. Try again.");
++    }
++    setBusy("");
++  }
++
++  return (
++    <div className="card" style={{ marginBottom: 18 }}>
++      <div className="row" style={{ marginTop: 0 }}>
++        <span className={`pill ${status}`}>{STATUS_LABEL[status] ?? status}</span>
++        {actions.map((a) =>
++          a === "request_changes" ? (
++            <button key={a} disabled={!!busy} onClick={() => setAskingChanges((v) => !v)}>{ACTIONS[a].label}</button>
++          ) : (
++            <button
++              key={a}
++              className={a === "approve" || a === "send_for_review" ? "primary" : ""}
++              disabled={!!busy}
++              onClick={() => run(a)}
++            >
++              {busy === a ? "Please wait..." : ACTIONS[a].label}
++            </button>
++          ),
++        )}
++      </div>
++
++      {askingChanges && (
++        <>
++          <label htmlFor="chg">What needs to change?</label>
++          <textarea id="chg" value={comment} onChange={(e) => setComment(e.target.value)} style={{ minHeight: 80 }} />
++          <div className="row">
++            <button className="primary" disabled={!!busy || !comment.trim()} onClick={() => run("request_changes", comment)}>
++              Send feedback
++            </button>
++          </div>
++        </>
++      )}
++
++      {feedback?.comment && (
++        <p style={{ marginBottom: 0 }}>
++          <strong>Changes requested by {feedback.actor}:</strong> {feedback.comment}{" "}
++          <button style={{ padding: "3px 9px", fontSize: 13 }} onClick={() => onApplyFeedback(feedback.comment ?? "")}>
++            Use as instruction
++          </button>
++        </p>
++      )}
++
++      {error && <p className="error">{error}</p>}
++
++      <details style={{ borderTop: "none", paddingBottom: 0 }}>
++        <summary>History ({events.length})</summary>
++        <ul className="timeline">
++          {events.map((e) => (
++            <li key={e.id}>
++              <strong>{e.action.replace(/_/g, " ")}</strong> · {e.actor} · {fmt(e.createdAt)}
++              {e.toStatus ? <span className="muted"> → {STATUS_LABEL[e.toStatus] ?? e.toStatus}</span> : null}
++              {e.comment ? <span className="muted"> — {e.comment}</span> : null}
++            </li>
++          ))}
++        </ul>
++      </details>
++    </div>
++  );
++}
+diff --git a/lib/prompt.ts b/lib/prompt.ts
+index f1537f2..39591b8 100644
+--- a/lib/prompt.ts
++++ b/lib/prompt.ts
+@@ -1,4 +1,5 @@
+ import type { ChatMessage } from "./openai";
++import type { Workflow } from "./workflows";
+ 
+ const OUTPUT_RULES = `HOW TO RESPOND
+ You are chatting with a marketing team member. Deliver the finished work itself, not a brief about the work, unless they explicitly ask for a brief, outline or plan.
+@@ -30,7 +31,7 @@ Editing and follow-ups
+ - When asked to change something, return the full updated version (not only the changed part) unless the user asks for just a snippet. Keep everything they did not ask to change.
+ - When the user moves to a new topic in the same chat, start a fresh piece for the same brand.`;
+ 
+-export function buildSystem(brandName: string, context: string): ChatMessage {
++export function buildSystem(brandName: string, context: string, workflow?: Workflow): ChatMessage {
+   const today = new Date().toISOString().slice(0, 10);
+   return {
+     role: "system",
+@@ -39,6 +40,9 @@ export function buildSystem(brandName: string, context: string): ChatMessage {
+       `=== BRAND CONTEXT ===\n${context}\n\n` +
+       `=== OUTPUT RULES ===\nThese rules decide the format and workflow of your answers and override any workflow, ` +
+       `format or output-field instructions that appear inside the brand context. The brand context's voice, audience, ` +
+-      `services and restrictions still apply fully.\n\n${OUTPUT_RULES}`,
++      `services and restrictions still apply fully.\n\n${OUTPUT_RULES}` +
++      (workflow && workflow.rules
++        ? `\n\n=== WORKFLOW: ${workflow.label} ===\nThe workflow rules below take priority over the general rules above where they differ.\n\n${workflow.rules}`
++        : ""),
+   };
+ }
+diff --git a/lib/status.ts b/lib/status.ts
+new file mode 100644
+index 0000000..1aabf19
+--- /dev/null
++++ b/lib/status.ts
+@@ -0,0 +1,42 @@
++// Approval workflow for a chat. Client-safe (no server imports).
++export const STATUSES = ["draft", "in_review", "changes_requested", "approved", "ready_to_publish"] as const;
++export type Status = (typeof STATUSES)[number];
++
++export const STATUS_LABEL: Record<string, string> = {
++  draft: "Draft",
++  in_review: "In review",
++  changes_requested: "Changes requested",
++  approved: "Approved",
++  ready_to_publish: "Ready to publish",
++};
++
++// Approved / ready chats are locked until someone reopens them.
++export const LOCKED: string[] = ["approved", "ready_to_publish"];
++
++export type ActionKey = "send_for_review" | "approve" | "request_changes" | "ready_to_publish" | "reopen";
++
++export const ACTIONS: Record<ActionKey, { label: string; from: Status[]; to: Status; needsComment?: boolean }> = {
++  send_for_review: { label: "Send for review", from: ["draft", "changes_requested"], to: "in_review" },
++  approve: { label: "Approve", from: ["in_review"], to: "approved" },
++  request_changes: { label: "Request changes", from: ["in_review"], to: "changes_requested", needsComment: true },
++  ready_to_publish: { label: "Mark ready to publish", from: ["approved"], to: "ready_to_publish" },
++  reopen: { label: "Reopen for editing", from: ["in_review", "approved", "ready_to_publish"], to: "draft" },
++};
++
++export function availableActions(status: string): ActionKey[] {
++  return (Object.keys(ACTIONS) as ActionKey[]).filter((k) => (ACTIONS[k].from as string[]).includes(status));
++}
++
++export function applyAction(
++  status: string,
++  action: string,
++  comment: string,
++): { ok: true; to: Status } | { ok: false; error: string } {
++  const def = ACTIONS[action as ActionKey];
++  if (!def) return { ok: false, error: "Unknown action" };
++  if (!(def.from as string[]).includes(status)) {
++    return { ok: false, error: `"${def.label}" is not possible while the chat is "${STATUS_LABEL[status] ?? status}"` };
++  }
++  if (def.needsComment && !comment.trim()) return { ok: false, error: "A comment is required" };
++  return { ok: true, to: def.to };
++}
+diff --git a/lib/workflows.ts b/lib/workflows.ts
+new file mode 100644
+index 0000000..b995a45
+--- /dev/null
++++ b/lib/workflows.ts
+@@ -0,0 +1,149 @@
++// Content workflows (presets). Client-safe: used by the New chat form (fields) and the server (rules).
++export type Field = {
++  name: string;
++  label: string;
++  type: "text" | "textarea" | "select";
++  required?: boolean;
++  placeholder?: string;
++  options?: string[];
++  defaultValue?: string;
++};
++
++export type Workflow = {
++  key: string;
++  label: string;
++  description: string;
++  fields: Field[];
++  rules: string; // appended to the system message for every message in the chat
++  buildMessage: (v: Record<string, string>) => string;
++  title: (v: Record<string, string>) => string;
++};
++
++const line = (label: string, value?: string) => (value && value.trim() ? `${label}: ${value.trim()}\n` : "");
++
++const WORKFLOW_LIST: Workflow[] = [
++  {
++    key: "seo_blog",
++    label: "SEO blog post",
++    description: "Publish-ready blog with SEO title, meta, FAQ, CTA and image slots.",
++    fields: [
++      { name: "topic", label: "Topic", type: "text", required: true, placeholder: "e.g. How Hajj agencies can manage pilgrim documents with software" },
++      { name: "keywords", label: "Target keywords", type: "text", placeholder: "primary keyword, related keywords" },
++      { name: "market", label: "Market / city", type: "text", defaultValue: "India" },
++      { name: "audience", label: "Audience", type: "text", placeholder: "defaults to the brand's main audience" },
++      { name: "length", label: "Length", type: "select", options: ["800-1000 words", "1200-1500 words", "1800-2200 words"], defaultValue: "1200-1500 words" },
++      { name: "notes", label: "Extra notes", type: "textarea", placeholder: "angle, points to include, things to avoid (optional)" },
++    ],
++    rules: `Deliver a complete, publish-ready blog post following the blog structure from the output rules.
++- The H1 contains the primary keyword naturally. Use the primary keyword in the first 100 words and in at least one H2. Never stuff keywords; use related terms and natural variations.
++- Include the "SEO title:", "Meta description:" and "Slug:" lines first.
++- Include 1 hero image slot plus roughly one image slot per 2-3 sections.
++- After the closing CTA add a horizontal rule and a short section titled "Notes for editor (not for publishing)" with: 3-5 internal link ideas (page topic + suggested anchor text) and any [VERIFY] items you used.`,
++    buildMessage: (v) =>
++      `Write a publish-ready SEO blog post.\n${line("Topic", v.topic)}${line("Target keywords", v.keywords)}${line("Market", v.market)}${line("Audience", v.audience)}${line("Length", v.length)}${line("Extra notes", v.notes)}`.trim(),
++    title: (v) => `SEO blog: ${v.topic}`,
++  },
++  {
++    key: "seo_brief",
++    label: "SEO content brief",
++    description: "Search intent, keyword hypotheses, outline, FAQs and evidence gaps for a writer.",
++    fields: [
++      { name: "topic", label: "Topic", type: "text", required: true },
++      { name: "keywords", label: "Target keywords", type: "text", placeholder: "optional, otherwise suggest hypotheses" },
++      { name: "market", label: "Market / country", type: "text", defaultValue: "India" },
++      { name: "audience", label: "Audience", type: "text" },
++      { name: "notes", label: "Extra notes", type: "textarea" },
++    ],
++    rules: `Deliver a content brief a writer can start from immediately (this workflow is the one place a brief is wanted, so a structured brief is correct here). Include:
++1. Search intent and funnel stage.
++2. Primary keyword and related keywords, clearly labelled as hypotheses. Never invent search volumes or rankings.
++3. Two title options and two meta description options.
++4. A detailed outline with H2/H3 headings and a one-line note on what each section must cover.
++5. FAQ questions to answer directly (with the answer angle).
++6. Internal link suggestions, evidence gaps and claims to verify, and a short reviewer checklist.`,
++    buildMessage: (v) =>
++      `Prepare an SEO content brief.\n${line("Topic", v.topic)}${line("Target keywords", v.keywords)}${line("Market", v.market)}${line("Audience", v.audience)}${line("Extra notes", v.notes)}`.trim(),
++    title: (v) => `SEO brief: ${v.topic}`,
++  },
++  {
++    key: "aeo_faq",
++    label: "AEO FAQ",
++    description: "Direct question-and-answer set built for answer engines, with FAQ schema.",
++    fields: [
++      { name: "topic", label: "Topic", type: "text", required: true },
++      { name: "count", label: "Number of questions", type: "select", options: ["6", "8", "10", "12"], defaultValue: "8" },
++      { name: "market", label: "Market / city", type: "text", defaultValue: "India" },
++      { name: "audience", label: "Audience", type: "text" },
++      { name: "notes", label: "Extra notes", type: "textarea" },
++    ],
++    rules: `Deliver an answer-engine-optimised FAQ ready to publish.
++- Questions are phrased the way real people ask or search them (what / how / why / cost / difference / is it suitable). Mix informational and decision-stage questions.
++- Each question is a Markdown H3. Each answer starts with a direct one-sentence answer, then 1-2 supporting sentences, 40-60 words in total, plain language, no marketing fluff.
++- Use only facts from the brand context or the user's message. If an answer needs an unknown fact (price, regulation, feature), write the most useful safe answer and add a short [VERIFY: ...] note.
++- After the Q&A, add a section "FAQPage schema" containing valid FAQPage JSON-LD in a json code block that mirrors the answers exactly.
++- No image slots in this workflow.`,
++    buildMessage: (v) =>
++      `Create an AEO FAQ with ${v.count || "8"} questions.\n${line("Topic", v.topic)}${line("Market", v.market)}${line("Audience", v.audience)}${line("Extra notes", v.notes)}`.trim(),
++    title: (v) => `AEO FAQ: ${v.topic}`,
++  },
++  {
++    key: "geo_content",
++    label: "GEO content",
++    description: "Entity statements, citation-worthy facts, schema and an AI-visibility test plan.",
++    fields: [
++      { name: "subject", label: "Product / service / topic", type: "text", required: true },
++      { name: "market", label: "Market", type: "text", defaultValue: "India" },
++      { name: "audience", label: "Audience", type: "text" },
++      { name: "notes", label: "Extra notes", type: "textarea" },
++    ],
++    rules: `Deliver content that helps AI answer engines understand and cite the brand. Output these sections in order:
++1. "Entity statements": the brand described in one sentence, in about 50 words and in about 120 words. Precise, factual, quotable, same wording for the name, category and audience each time.
++2. "Citation-worthy facts": a list of specific factual statements about the brand and subject. After each add [from brand context] if it comes from the brand context or the user's message, otherwise [VERIFY]. Never invent facts.
++3. "Page copy": publish-ready copy for an About / "What is <subject>" page, with clear H2 headings and definitions an AI could quote.
++4. "Structured data": Organization (and Product or Service where relevant) JSON-LD in a json code block, using only confirmed facts and leaving unknown fields out.
++5. "AI visibility test plan": 10 realistic prompts to test monthly in ChatGPT, Gemini and Perplexity, and what to record each time (mentioned or not, cited or not, accuracy, competitors named).
++Never promise or imply guaranteed citations or rankings. No image slots in this workflow.`,
++    buildMessage: (v) =>
++      `Create GEO (generative engine optimisation) content.\n${line("Subject", v.subject)}${line("Market", v.market)}${line("Audience", v.audience)}${line("Extra notes", v.notes)}`.trim(),
++    title: (v) => `GEO: ${v.subject}`,
++  },
++  {
++    key: "social",
++    label: "Social content",
++    description: "Platform-native posts or a content calendar with captions, CTAs and image slots.",
++    fields: [
++      { name: "platform", label: "Platform", type: "select", required: true, options: ["LinkedIn", "Instagram", "Facebook", "X (Twitter)", "YouTube Shorts / Reels", "WhatsApp broadcast"], defaultValue: "LinkedIn" },
++      { name: "format", label: "Format", type: "select", options: ["Single post", "1-week plan (5 posts)", "2-week calendar (10 posts)"], defaultValue: "Single post" },
++      { name: "topic", label: "Topic / goal", type: "text", required: true },
++      { name: "audience", label: "Audience", type: "text" },
++      { name: "notes", label: "Extra notes", type: "textarea" },
++    ],
++    rules: `Deliver ready-to-post social content for the chosen platform.
++- Write in the platform's native style and length. Hook in the first line. A clear single CTA that matches the brand's preferred CTA.
++- For each post give: Post title (for internal use), the caption / copy ready to paste, hashtags (3-8 relevant ones; 3-5 on LinkedIn), CTA, and a one-line creative direction.
++- For visual platforms (Instagram, Facebook, LinkedIn) add one image slot per post. For short video (YouTube Shorts / Reels) add a 30-second script with scenes instead of an image slot.
++- For a plan or calendar, number the posts, suggest a day and time slot for each, and vary the formats and angles so the feed does not repeat itself.
++- Emojis only if the brand voice uses them, and sparingly.`,
++    buildMessage: (v) =>
++      `Create social media content.\n${line("Platform", v.platform)}${line("Format", v.format)}${line("Topic / goal", v.topic)}${line("Audience", v.audience)}${line("Extra notes", v.notes)}`.trim(),
++    title: (v) => `${v.platform || "Social"}: ${v.topic}`,
++  },
++];
++
++export const FREE_WORKFLOW: Workflow = {
++  key: "free",
++  label: "Free chat",
++  description: "Ask for anything in your own words.",
++  fields: [{ name: "message", label: "What do you want written?", type: "textarea", required: true, placeholder: "e.g. Write a LinkedIn post announcing our new feature..." }],
++  rules: "",
++  buildMessage: (v) => (v.message ?? "").trim(),
++  title: (v) => (v.message ?? "").replace(/\s+/g, " ").trim(),
++};
++
++export const WORKFLOWS: Workflow[] = [...WORKFLOW_LIST, FREE_WORKFLOW];
++
++export function getWorkflow(key: string | null | undefined): Workflow | undefined {
++  return WORKFLOWS.find((w) => w.key === (key || "free"));
++}
++
++export const WORKFLOW_LABEL: Record<string, string> = Object.fromEntries(WORKFLOWS.map((w) => [w.key, w.label]));
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 7f043fa..0a619c0 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -16,18 +16,39 @@ model Brand {
+   conversations Conversation[]
+ }
+ 
++// workflow: free | seo_blog | seo_brief | aeo_faq | geo_content | social
++// status:   draft | in_review | changes_requested | approved | ready_to_publish
+ model Conversation {
+-  id        String    @id @default(cuid())
++  id        String       @id @default(cuid())
+   brandId   String
+-  brand     Brand     @relation(fields: [brandId], references: [id])
++  brand     Brand        @relation(fields: [brandId], references: [id])
+   title     String
++  workflow  String       @default("free")
++  status    String       @default("draft")
+   createdBy String
+-  createdAt DateTime  @default(now())
+-  updatedAt DateTime  @default(now())
++  createdAt DateTime     @default(now())
++  updatedAt DateTime     @default(now())
+   messages  Message[]
++  events    AuditEvent[]
+ 
+   @@index([brandId])
+   @@index([updatedAt])
++  @@index([status])
++}
++
++// Who did what and when: created, status changes, back-to-draft after edits.
++model AuditEvent {
++  id             String       @id @default(cuid())
++  conversationId String
++  conversation   Conversation @relation(fields: [conversationId], references: [id])
++  action         String
++  actor          String
++  fromStatus     String?
++  toStatus       String?
++  comment        String?
++  createdAt      DateTime     @default(now())
++
++  @@index([conversationId, createdAt])
+ }
+ 
+ // role: user | assistant
+-- 
+2.43.0
+

@@ -1,4 +1,5 @@
 import type { ChatMessage } from "./openai";
+import type { Workflow } from "./workflows";
 
 const OUTPUT_RULES = `HOW TO RESPOND
 You are chatting with a marketing team member. Deliver the finished work itself, not a brief about the work, unless they explicitly ask for a brief, outline or plan.
@@ -30,7 +31,7 @@ Editing and follow-ups
 - When asked to change something, return the full updated version (not only the changed part) unless the user asks for just a snippet. Keep everything they did not ask to change.
 - When the user moves to a new topic in the same chat, start a fresh piece for the same brand.`;
 
-export function buildSystem(brandName: string, context: string): ChatMessage {
+export function buildSystem(brandName: string, context: string, workflow?: Workflow): ChatMessage {
   const today = new Date().toISOString().slice(0, 10);
   return {
     role: "system",
@@ -39,6 +40,9 @@ export function buildSystem(brandName: string, context: string): ChatMessage {
       `=== BRAND CONTEXT ===\n${context}\n\n` +
       `=== OUTPUT RULES ===\nThese rules decide the format and workflow of your answers and override any workflow, ` +
       `format or output-field instructions that appear inside the brand context. The brand context's voice, audience, ` +
-      `services and restrictions still apply fully.\n\n${OUTPUT_RULES}`,
+      `services and restrictions still apply fully.\n\n${OUTPUT_RULES}` +
+      (workflow && workflow.rules
+        ? `\n\n=== WORKFLOW: ${workflow.label} ===\nThe workflow rules below take priority over the general rules above where they differ.\n\n${workflow.rules}`
+        : ""),
   };
 }

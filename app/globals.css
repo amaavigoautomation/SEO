@@ -34,7 +34,11 @@ th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacin
 th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 td a { text-decoration: none; font-weight: 600; }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; }
-.pill.pending_review { color: var(--warn); } .pill.approved { color: var(--ok); } .pill.failed { color: var(--bad); }
+.pill { color: var(--muted); }
+.pill.draft { color: var(--muted); } .pill.in_review { color: var(--warn); } .pill.changes_requested { color: var(--bad); }
+.pill.approved { color: var(--ok); } .pill.ready_to_publish { color: var(--accent); }
+button.pill.choice { background: transparent; cursor: pointer; padding: 5px 12px; font-size: 13px; color: var(--muted); }
+button.pill.choice.on { color: var(--accent-text); background: var(--accent); border-color: var(--accent); }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .output { white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
 details { border-top: 1px solid var(--line); padding: 10px 0; }

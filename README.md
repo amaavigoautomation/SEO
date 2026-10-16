@@ -29,3 +29,20 @@ Chat and image routes allow up to 300s (Vercel Hobby maximum).
 ## Find which models work on your key
 `npm run check:models` tests every chat model your key can use and prints your request/minute and token/minute limits.
 The first line of its output lists the image models on your key; put one in OPENAI_IMAGE_MODEL.
+
+## Workflows and approval (added)
+
+**Content types** (pick on "New chat"): SEO blog, SEO brief, AEO FAQ, GEO content, Social posts, Free chat. Each has fixed input fields and fixed output rules on top of the brand context. Then keep chatting to request edits or new topics.
+
+**Status flow:** Draft → In review → Approved → Ready to publish. A reviewer can send In review → Changes requested (comment required). Approved chats are locked until reopened. Editing a chat in review sends it back to Draft. Every step is stored in the chat's History with who and when.
+
+**Dashboard:** the home page shows counts per status and filters by brand, status and content type.
+
+**Upgrade an existing database:** after pulling this branch run
+
+    npx prisma db push
+    npx prisma generate
+
+Existing chats become "Free chat" / "Draft". Then restart `npm run dev`.
+
+**Vercel:** set every variable from `.env.example` in Project → Settings → Environment Variables, use a hosted Postgres, deploy.

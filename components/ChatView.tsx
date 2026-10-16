@@ -1,7 +1,10 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import MessageBody from "./MessageBody";
+import StatusPanel, { type EventRow } from "./StatusPanel";
 import { toHtmlBody, toHtmlDocument, toMarkdown } from "@/lib/export";
+import { LOCKED } from "@/lib/status";
 
 export type Msg = {
   id: string;
@@ -12,13 +15,17 @@ export type Msg = {
   images: { slot: number; id: string }[];
 };
 
-export default function ChatView({ chatId, initial }: { chatId: string; initial: Msg[] }) {
+export default function ChatView({
+  chatId, initial, status, events,
+}: { chatId: string; initial: Msg[]; status: string; events: EventRow[] }) {
+  const router = useRouter();
   const [msgs, setMsgs] = useState<Msg[]>(initial);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+  const locked = LOCKED.includes(status);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -26,7 +33,7 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
 
   async function send() {
     const message = input.trim();
-    if (!message || busy) return;
+    if (!message || busy || locked) return;
     setBusy(true);
     setError("");
     try {
@@ -39,6 +46,7 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
       if (res.ok) {
         setMsgs((m) => [...m, data.user, data.assistant]);
         setInput("");
+        router.refresh(); // status may have gone back to draft
       } else {
         setError(data.error ?? `Request failed (${res.status})`);
       }
@@ -77,6 +85,14 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
 
   return (
     <>
+      <StatusPanel
+        chatId={chatId}
+        status={status}
+        events={events}
+        hasDraft={msgs.some((m) => m.role === "assistant")}
+        onApplyFeedback={(t) => setInput(t)}
+      />
+
       <div className="chat">
         {msgs.map((m) =>
           m.role === "user" ? (
@@ -109,18 +125,24 @@ export default function ChatView({ chatId, initial }: { chatId: string; initial:
       <div className="composer">
         {note && <p className="muted" style={{ margin: "0 0 6px" }}>{note}</p>}
         {error && <p className="error" style={{ margin: "0 0 6px" }}>{error}</p>}
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
-          }}
-          placeholder="Ask for changes, or a new topic. e.g. make the intro shorter / now write a blog on Umrah package management software"
-        />
-        <div className="row" style={{ marginTop: 8 }}>
-          <button className="primary" onClick={send} disabled={busy || !input.trim()}>{busy ? "Writing..." : "Send"}</button>
-          <span className="muted">Ctrl+Enter to send</span>
-        </div>
+        {locked ? (
+          <p className="muted">This chat is locked because it is approved. Use “Reopen for editing” above to make changes.</p>
+        ) : (
+          <>
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
+              }}
+              placeholder="Ask for changes, or a new topic. e.g. make the intro shorter / now write a blog on Umrah package management software"
+            />
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="primary" onClick={send} disabled={busy || !input.trim()}>{busy ? "Writing..." : "Send"}</button>
+              <span className="muted">Ctrl+Enter to send</span>
+            </div>
+          </>
+        )}
       </div>
     </>
   );

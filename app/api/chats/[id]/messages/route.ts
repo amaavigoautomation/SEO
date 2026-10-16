@@ -5,6 +5,8 @@ import { prisma } from "@/lib/prisma";
 import { getSession } from "@/lib/session";
 import { generate, type ChatMessage } from "@/lib/openai";
 import { buildSystem } from "@/lib/prompt";
+import { getWorkflow } from "@/lib/workflows";
+import { LOCKED } from "@/lib/status";
 
 const HISTORY_LIMIT = 20; // last N messages are sent along with the brand context
 
@@ -20,6 +22,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   const chat = await prisma.conversation.findUnique({ where: { id }, include: { brand: true } });
   if (!chat) return NextResponse.json({ error: "Chat not found" }, { status: 404 });
+  if (LOCKED.includes(chat.status)) {
+    return NextResponse.json({ error: "This chat is approved. Reopen it to make changes." }, { status: 409 });
+  }
 
   const recent = await prisma.message.findMany({
     where: { conversationId: id },
@@ -32,7 +37,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   try {
     const { text, model } = await generate([
-      buildSystem(chat.brand.name, chat.brand.context),
+      buildSystem(chat.brand.name, chat.brand.context, getWorkflow(chat.workflow)),
       ...history,
       { role: "user", content: message },
     ]);
@@ -43,7 +48,29 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const assistant = await prisma.message.create({
       data: { conversationId: id, role: "assistant", content: text, model, createdAt: new Date(now + 1) },
     });
-    await prisma.conversation.update({ where: { id }, data: { updatedAt: new Date() } });
+
+    // Editing a chat that was in review or had changes requested sends it back to draft.
+    const backToDraft = chat.status === "in_review" || chat.status === "changes_requested";
+    await prisma.conversation.update({
+      where: { id },
+      data: {
+        updatedAt: new Date(),
+        ...(backToDraft
+          ? {
+              status: "draft",
+              events: {
+                create: {
+                  action: "back_to_draft",
+                  actor: session.name,
+                  fromStatus: chat.status,
+                  toStatus: "draft",
+                  comment: "New edit requested in chat",
+                },
+              },
+            }
+          : {}),
+      },
+    });
     return NextResponse.json({
       user: { id: user.id, role: "user", content: user.content, createdBy: user.createdBy, model: null, images: [] },
       assistant: { id: assistant.id, role: "assistant", content: assistant.content, createdBy: null, model, images: [] },

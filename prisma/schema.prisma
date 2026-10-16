@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("GROWTH_OS_DATABASE_URL")
+}
+
+model Brand {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  context       String // full brand context sent to OpenAI as the system message
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  conversations Conversation[]
+}
+
+model Conversation {
+  id        String    @id @default(cuid())
+  brandId   String
+  brand     Brand     @relation(fields: [brandId], references: [id])
+  title     String
+  createdBy String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @default(now())
+  messages  Message[]
+
+  @@index([brandId])
+  @@index([updatedAt])
+}
+
+// role: user | assistant
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  role           String
+  content        String
+  model          String? // which OpenAI model answered (primary or fallback)
+  createdBy      String?
+  createdAt      DateTime     @default(now())
+  images         Image[]
+
+  @@index([conversationId, createdAt])
+}
+
+// One generated image per [[IMAGE: ...]] slot of an assistant message.
+model Image {
+  id        String   @id @default(cuid())
+  messageId String
+  message   Message  @relation(fields: [messageId], references: [id])
+  slot      Int
+  prompt    String
+  alt       String
+  mime      String
+  data      Bytes
+  createdAt DateTime @default(now())
+
+  @@unique([messageId, slot])
+}

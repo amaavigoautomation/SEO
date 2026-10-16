@@ -1,36 +1,31 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Growth OS
 
-## Getting Started
+Brand context store + OpenAI chat that writes publish-ready content, with a shared team login.
 
-First, run the development server:
+## How it works
+Brands (full context) -> New chat (pick brand, say what you want) -> server sends
+`brand context + output rules + chat history` to OpenAI -> reply is shown as formatted text.
+Keep chatting in the same thread: ask for changes (you get the full updated version) or move to a new topic.
+Primary model `OPENAI_MODEL`, automatic fallback to `OPENAI_FALLBACK_MODEL`. If both fail you see the error and nothing is saved.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+Blogs come with SEO title, meta description, slug, H1/H2 structure, an answer-first intro (AEO), FAQ, GEO-friendly
+factual statements, CTA, and image slots. Each image slot has a **Generate image** button (needs OPENAI_IMAGE_MODEL).
+Under every reply: Copy text / Copy Markdown / Copy HTML / Download .html. Generated images download as image-1.png, image-2.png...
+and match the file names used in the exported HTML.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Local setup
+1. Create a free Postgres DB (Neon / Supabase) and copy its connection string.
+2. `cp .env.example .env` and fill in: GROWTH_OS_DATABASE_URL, OPENAI_API_KEY, OPENAI_MODEL, OPENAI_FALLBACK_MODEL,
+   OPENAI_IMAGE_MODEL, APP_PASSWORD, AUTH_SECRET (random 32+ chars).
+3. `npm install`
+4. `npx prisma db push --accept-data-loss`  (creates tables; drops the old task/review tables from the previous version)
+5. `npm run db:reseed`  (loads Amaavigo, Umrah360, AscentAbility with cleaned-up contexts; use `npm run db:seed` to only add missing brands)
+6. `npm run dev` -> http://localhost:3000
 
 ## Deploy on Vercel
+Push to GitHub, import in Vercel, add the same env vars, deploy, and run steps 4-5 once against the production DB.
+Chat and image routes allow up to 300s (Vercel Hobby maximum).
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Find which models work on your key
+`npm run check:models` tests every chat model your key can use and prints your request/minute and token/minute limits.
+The first line of its output lists the image models on your key; put one in OPENAI_IMAGE_MODEL.

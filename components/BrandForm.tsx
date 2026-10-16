@@ -27,6 +27,8 @@ export default function BrandForm({ brand }: { brand?: { id: string; name: strin
     }
   }
 
+  // test
+
   return (
     <form className="card" onSubmit={submit}>
       <label htmlFor="name">Brand name</label>

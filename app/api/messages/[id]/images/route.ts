@@ -25,7 +25,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   try {
     const { data, mime } = await generateImage(seg.prompt);
     await prisma.image.deleteMany({ where: { messageId: id, slot } });
-    const img = await prisma.image.create({ data: { messageId: id, slot, prompt: seg.prompt, alt: seg.alt, mime, data } });
+    const img = await prisma.image.create({ data: { messageId: id, slot, prompt: seg.prompt, alt: seg.alt, mime, data: new Uint8Array(data) } });    
     return NextResponse.json({ id: img.id });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });
